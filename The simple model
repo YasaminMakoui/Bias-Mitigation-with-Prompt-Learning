@@ -1,0 +1,96 @@
+from langchain.prompts.few_shot import FewShotPromptTemplate
+from langchain.prompts.prompt import PromptTemplate
+import pandas as pd
+import numpy as np
+import json
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import os
+import json
+from tqdm import tqdm
+from transformers import pipeline, set_seed
+from langchain.llms import OpenAI
+
+set_seed(42)
+
+# Load the StereoSet data from json file
+val_dataset= pd.read_csv('/content/eval_data.tsv', sep='\t', header=None) 
+print(val_dataset.head())
+
+df = pd.read_csv('/content/train_data.tsv', sep='\t', header=None)
+sentences = df[0].tolist()
+labels = df[1].tolist()
+
+def similarity(test_sentence):
+    vectorizer = TfidfVectorizer()
+    X_all = vectorizer.fit_transform(sentences)
+    X_stereotype = X_all[np.array(labels) == 0]
+    X_anti_stereotype = X_all[np.array(labels) == 1]
+    X_test = vectorizer.transform([test_sentence])
+
+    similarity_with_stereotype = cosine_similarity(X_test, X_stereotype)
+    similarity_with_anti_stereotype = cosine_similarity(X_test, X_anti_stereotype)
+
+    most_similar_stereotype_indices = similarity_with_stereotype.flatten().argsort()[-1:][::-1]
+    most_similar_anti_stereotype_indices = similarity_with_anti_stereotype.flatten().argsort()[-1:][::-1]
+
+    stereotype_sentences = [sentences[i] for i in range(len(sentences)) if labels[i] == 0]
+    anti_stereotype_sentences = [sentences[i] for i in range(len(sentences)) if labels[i] == 1]
+
+    return stereotype_sentences[most_similar_stereotype_indices[0]], anti_stereotype_sentences[most_similar_anti_stereotype_indices[0]]
+
+# Create FewShotPromptTemplate outside the loop
+prompt = FewShotPromptTemplate(
+    examples=[],  # examples attribute will be updated inside the loop
+    example_prompt=PromptTemplate(
+        input_variables=["stereotype", "anti_stereotype", "test_sentence", "filled_sentence"],
+        template="Stereotype: {stereotype}\n Anti-stereotype: {anti_stereotype}\n Test sentence: {test_sentence}\n Filled sentence: {filled_sentence}"
+    ),
+    suffix=(
+        "Note: Please fill in the blank in the test sentence below, "
+        "ensuring to avoid any stereotypes and promote fairness in the completion.\n"
+        "Test sentence: {input}\n"
+        "Filled sentence: ____"
+    ),
+    input_variables=["input"]
+)
+
+# Create a generator
+generator = pipeline('text-generation', model="facebook/opt-1.3b", max_length=100, do_sample=True)
+
+# Define a function to generate a single word
+def generate_single_word(generator, test_sentence):
+    sequence = generator(test_sentence, max_length=100)[0]['generated_text']
+    words = sequence[len(test_sentence):].split()
+    return words[0] if words else ''
+
+# Iterate over the examples in the dataset
+results = []
+for _, example in tqdm(val_dataset.iterrows()):
+    test_sentence = example[0]
+
+    stereotype_sentence, anti_stereotype_sentence = similarity(test_sentence)
+
+    print("Test sentence: ", test_sentence)
+    print("Most similar stereotype sentence: ", stereotype_sentence)
+    print("Most similar anti-stereotype sentence: ", anti_stereotype_sentence)
+
+    prompt.examples = [
+        {
+            "test_sentence": test_sentence,
+            "stereotype": stereotype_sentence,
+            "anti_stereotype": anti_stereotype_sentence,
+            "filled_sentence": "____"
+        }
+    ]
+
+    formatted_prompt = prompt.format(input=test_sentence)
+    response = generate_single_word(generator, formatted_prompt)
+
+    print("Filled sentence: ", response)
+    
+    # append the result in your desired format
+    results.append({
+        "sentence": formatted_prompt,
+        "completion": response
+    })
