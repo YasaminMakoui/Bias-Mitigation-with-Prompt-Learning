@@ -1,0 +1,130 @@
+from langchain.prompts.few_shot import FewShotPromptTemplate
+from langchain.prompts.prompt import PromptTemplate
+import pandas as pd
+import numpy as np
+import json
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import os
+import json
+from tqdm import tqdm
+from transformers import pipeline, set_seed
+
+
+from transformers import pipeline, set_seed
+
+set_seed(32)
+generator = pipeline('text-generation', model="facebook/opt-1.3b", do_sample=True)
+
+def generate_single_word(generator, prompt):
+    # Generate a sequence
+    sequence = generator(prompt)[0]['generated_text']
+
+    # Extract the first word after the prompt
+    # Assume that words are separated by white spaces
+    words = sequence[len(prompt):].split()
+
+    # Return the first word, if any
+    return words[0] if words else ''
+
+# Load the StereoSet data from json file
+with open('/content/stereoset/data/dev.json', 'r') as f:
+    dataset = json.load(f)
+
+df = pd.read_csv('/content/train_data.tsv', sep='\t', header=None)
+sentences = df[0].tolist()
+labels = df[1].tolist()
+
+def similarity(test_sentence):
+
+    vectorizer = TfidfVectorizer()
+    X_all = vectorizer.fit_transform(sentences)
+
+    X_stereotype = X_all[np.array(labels) == 0]
+    X_anti_stereotype = X_all[np.array(labels) == 1]
+
+    X_test = vectorizer.transform([test_sentence])
+
+    similarity_with_stereotype = cosine_similarity(X_test, X_stereotype)
+    similarity_with_anti_stereotype = cosine_similarity(X_test, X_anti_stereotype)
+
+    most_similar_stereotype_indices = similarity_with_stereotype.flatten().argsort()[-2:][::-1]
+    most_similar_anti_stereotype_indices = similarity_with_anti_stereotype.flatten().argsort()[-2:][::-1]
+
+    stereotype_sentences = [sentences[i] for i in range(len(sentences)) if labels[i] == 0]
+    anti_stereotype_sentences = [sentences[i] for i in range(len(sentences)) if labels[i] == 1]
+
+    return [stereotype_sentences[i] for i in most_similar_stereotype_indices], [anti_stereotype_sentences[i] for i in most_similar_anti_stereotype_indices]
+
+# Create FewShotPromptTemplate outside the loop
+
+prompt = FewShotPromptTemplate(
+    examples=[],  # examples attribute will be updated inside the loop
+    example_prompt=PromptTemplate(
+        input_variables=["stereotype", "anti_stereotype", "test_sentence", "filled_sentence"],
+        template="Stereotype: {stereotype}\nAnti-stereotype: {anti_stereotype}\nTest sentence: {test_sentence}\nFilled sentence: {filled_sentence}"
+    ),
+    suffix=(
+        "Note: For the following task, you are to fill in the blank in the test sentence in an anti-stereotypical way. "
+        "Use the provided stereotype and anti-stereotype sentences as a guide.\n\n"
+        
+        "Test sentence: {input}\n"
+        "Filled sentence: ____"
+    ),
+    input_variables=["input"]
+)
+
+# Iterate over the examples in the dataset
+results = []
+for example in tqdm(dataset['data']['intrasentence'][:3]):
+    test_sentence = example['context']
+
+    stereotype_sentences, anti_stereotype_sentences = similarity(test_sentence)
+    for stereotype_sentence, anti_stereotype_sentence in zip(stereotype_sentences, anti_stereotype_sentences):
+        prompt.examples = [
+            {
+                "test_sentence": test_sentence,
+                "stereotype": stereotype_sentence,
+                "anti_stereotype": anti_stereotype_sentence,
+                "filled_sentence": "____"
+            }
+        ]
+
+        # Construct completion prompt separately
+        completion_prompt = (
+            "{input}"
+        ).format(input=test_sentence)
+
+        response = generator(completion_prompt, max_length=30, num_return_sequences=1)
+        
+        # append the result in your desired format
+        results.append({
+            "sentence": completion_prompt,
+            "gold_label": example['target'],
+            "completion": response[0]['generated_text']
+        })
+
+        formatted_prompt = prompt.format(input=test_sentence)
+        response = generator(formatted_prompt, max_length=30, num_return_sequences=1)
+
+
+
+# Convert results to StereoSet JSON format
+stereoset_results = []
+for result in results:
+    stereoset_result = {
+        "bias_type": "gender",  # you may change this depending on the bias type you are addressing
+        "sentences": [
+            {
+                "sentence": result['sentence'],
+                "gold_label": result['gold_label'],
+                "completions": [{"completion": result['completion']}]
+            }
+        ]
+    }
+    stereoset_results.append(stereoset_result)
+
+# Save results to a JSON file
+print(stereoset_results)
+with open('results.json', 'w') as f:
+    json.dump(stereoset_results, f)
